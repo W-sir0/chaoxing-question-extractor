@@ -1,24 +1,18 @@
 // ==UserScript==
 // @name         学习通题目提取工具
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.2.0
 // @description  提取学习通考试/作业题目，支持导出Word和PDF格式
-// @author       You
+// @author       W-sir0
 // @match        https://*.chaoxing.com/*
 // @match        http://*.chaoxing.com/*
 // @match        https://mooc1-*.chaoxing.com/*
 // @match        http://mooc1-*.chaoxing.com/*
-// @grant        GM_xmlhttpRequest
-// @grant        GM_download
+// @homepageURL  https://github.com/W-sir0/chaoxing-question-extractor
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @grant        unsafeWindow
 // @require      https://cdnjs.cloudflare.com/ajax/libs/docx/7.8.2/docx.min.js
-// @require      https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js
-// @require      https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.31/jspdf.plugin.autotable.min.js
-// @require      https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.js
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js
-// @connect      *
 // ==/UserScript==
 
 (function() {
@@ -26,35 +20,51 @@
 
     // 存储键名
     const STORAGE_KEY = 'cx_extracted_questions';
-    const STORAGE_TIMESTAMP_KEY = 'cx_extracted_timestamp';
     const OCR_ENABLED_KEY = 'cx_ocr_enabled';
 
     // OCR功能开关
-    let ocrEnabled = GM_getValue(OCR_ENABLED_KEY, false);
+    let ocrEnabled = false;
 
-    // 获取存储的题目
-    function getStoredQuestions() {
+    // 只复用当前 URL、OCR 设置及一小时内的缓存；旧格式不再读取。
+    function cacheIdentity(pageUrl = window.location.href, ocr = ocrEnabled) {
+        const url = new URL(pageUrl);
+        return JSON.stringify([url.origin, url.pathname, url.search, url.hash, Boolean(ocr)]);
+    }
+
+    function getStoredQuestions(identity = cacheIdentity()) {
         try {
-            const stored = GM_getValue(STORAGE_KEY, null);
-            const timestamp = GM_getValue(STORAGE_TIMESTAMP_KEY, 0);
-            // 如果存储时间在1小时内，使用缓存
-            if (stored && (Date.now() - timestamp < 3600000)) {
-                return stored;
+            const cached = GM_getValue(STORAGE_KEY, null);
+            const age = cached && Date.now() - cached.timestamp;
+            if (cached && cached.version === 2 && cached.identity === identity &&
+                Number.isFinite(age) && age >= 0 && age < 3600000 &&
+                Array.isArray(cached.questions) && cached.questions.every(q =>
+                    q && typeof q.title === 'string' && Array.isArray(q.options))) {
+                return cached.questions;
             }
-        } catch (e) {
-            console.error('读取缓存失败:', e);
+        } catch (error) {
+            console.error('读取缓存失败:', error);
         }
         return null;
     }
 
-    // 保存题目到存储
-    function saveQuestions(questions) {
+    function saveQuestions(questions, identity = cacheIdentity()) {
         try {
-            GM_setValue(STORAGE_KEY, questions);
-            GM_setValue(STORAGE_TIMESTAMP_KEY, Date.now());
-        } catch (e) {
-            console.error('保存缓存失败:', e);
+            GM_setValue(STORAGE_KEY, { version: 2, identity, timestamp: Date.now(), questions });
+        } catch (error) {
+            console.error('保存缓存失败:', error);
         }
+    }
+
+    function isVisible(element) {
+        for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+            if (node.hidden || node.getAttribute('aria-hidden') === 'true' ||
+                node.style.display === 'none' || node.style.visibility === 'hidden') return false;
+            if (typeof getComputedStyle === 'function') {
+                const style = getComputedStyle(node);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+            }
+        }
+        return true;
     }
 
     // 等待页面加载完成
@@ -93,23 +103,19 @@
         let questionElements = [];
         
         for (const selector of questionSelectors) {
-            const elements = document.querySelectorAll(selector);
+            const elements = Array.from(document.querySelectorAll(selector)).filter(el =>
+                !el.closest('#cx-question-extractor-panel') && isVisible(el));
             if (elements.length > 0) {
                 questionElements = Array.from(elements);
                 break;
             }
         }
 
-        // 如果没找到，尝试查找包含题目文本的元素
-        if (questionElements.length === 0) {
-            const allElements = document.querySelectorAll('div, li, p, span');
-            questionElements = Array.from(allElements).filter(el => {
-                const text = el.textContent.trim();
-                return text.match(/^[\d\.]+[、．.]/) || 
-                       text.match(/^[（(]\d+[）)]/) ||
-                       (text.length > 20 && text.length < 500);
-            });
-        }
+        // 排除嵌套重复、隐藏内容和工具自身；没有结构化题目时明确返回空结果。
+        questionElements = questionElements.filter(el =>
+            !el.closest('#cx-question-extractor-panel') && isVisible(el));
+        questionElements = questionElements.filter(el =>
+            !questionElements.some(other => other !== el && other.contains(el)));
 
         // 如果启用OCR，显示进度
         if (ocrEnabled && questionElements.length > 0) {
@@ -127,20 +133,6 @@
             } catch (error) {
                 console.error('提取题目时出错:', error);
             }
-        }
-
-        // 如果还是没找到，尝试从页面文本中提取
-        if (questions.length === 0) {
-            const pageText = document.body.innerText;
-            const lines = pageText.split('\n').filter(line => line.trim());
-            questions.push({
-                number: 1,
-                title: '页面内容',
-                options: [],
-                type: 'text',
-                content: lines.join('\n'),
-                ocrTexts: {}
-            });
         }
 
         return questions;
@@ -259,6 +251,14 @@
 
     // 提取单个题目的数据
     async function extractQuestionData(element, number) {
+        // 连正文和公式 HTML 一并排除隐藏内容，不能只过滤 answer 字段。
+        const visibleClone = element.cloneNode(true);
+        const originalNodes = Array.from(element.querySelectorAll('*'));
+        const clonedNodes = Array.from(visibleClone.querySelectorAll('*'));
+        originalNodes.forEach((node, index) => {
+            if (!isVisible(node)) clonedNodes[index].remove();
+        });
+        element = visibleClone;
         // 使用 textContent 而不是 innerText 以获得更好的文本提取
         const text = (element.textContent || element.innerText || '').trim();
         const html = element.innerHTML || '';
@@ -328,7 +328,7 @@
 
         // 提取答案（如果可见）
         let answer = '';
-        const answerElements = element.querySelectorAll('.answer, [class*="answer"], .right-answer, [class*="right"]');
+        const answerElements = Array.from(element.querySelectorAll('.answer, .right-answer, [class~="answer"]')).filter(isVisible);
         if (answerElements.length > 0) {
             answer = Array.from(answerElements).map(el => el.textContent.trim()).join(', ');
         }
@@ -368,22 +368,43 @@
             .trim();
     }
 
-    // HTML转义，防止XSS（但保留数学公式）
+    // 只保留排版、图片和 MathML；移除事件、样式及可执行链接。
     function escapeHtml(text, preserveMath = false) {
         if (!text) return '';
-        if (preserveMath) {
-            // 如果包含数学公式，使用更安全的方式
-            const div = document.createElement('div');
-            div.innerHTML = text;
-            // 移除script标签等危险内容
-            const scripts = div.querySelectorAll('script, iframe, object, embed');
-            scripts.forEach(s => s.remove());
-            return div.innerHTML;
-        } else {
-            const div = document.createElement('div');
-            div.textContent = text;
+        const div = document.createElement('div');
+        if (!preserveMath) {
+            div.textContent = String(text);
             return div.innerHTML;
         }
+        const parsed = new DOMParser().parseFromString(String(text), 'text/html');
+        const root = parsed.body;
+        const blocked = new Set(['script', 'style', 'iframe', 'object', 'embed', 'link',
+            'meta', 'base', 'form', 'input', 'button', 'svg', 'video', 'audio', 'template']);
+        const allowed = new Set(['div', 'p', 'span', 'br', 'b', 'strong', 'i', 'em', 'u',
+            'sub', 'sup', 'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tr', 'td', 'th',
+            'img', 'math', 'mrow', 'mi', 'mo', 'mn', 'mfrac', 'msqrt', 'mroot', 'msup',
+            'msub', 'msubsup', 'munder', 'mover', 'munderover', 'mtable', 'mtr', 'mtd',
+            'mtext', 'semantics', 'annotation']);
+        for (const node of Array.from(root.querySelectorAll('*'))) {
+            const tag = node.tagName.toLowerCase();
+            if (blocked.has(tag)) { node.remove(); continue; }
+            for (const attr of Array.from(node.attributes)) {
+                const name = attr.name.toLowerCase();
+                const imageAttr = tag === 'img' && ['src', 'alt', 'width', 'height'].includes(name);
+                const mathAttr = ['display', 'mathvariant', 'encoding', 'colspan', 'rowspan'].includes(name);
+                if (!imageAttr && !mathAttr) node.removeAttribute(attr.name);
+            }
+            if (tag === 'img') {
+                try {
+                    const src = new URL(node.getAttribute('src') || '', window.location.href);
+                    if (!['http:', 'https:'].includes(src.protocol) &&
+                        !/^data:image\/(png|jpeg|gif|webp);base64,/i.test(src.href)) node.remove();
+                    else node.setAttribute('src', src.href);
+                } catch (_) { node.remove(); }
+            }
+            if (!allowed.has(tag)) node.replaceWith(...node.childNodes);
+        }
+        return root.innerHTML;
     }
 
     // 处理数学公式，转换为可显示的格式
@@ -687,6 +708,7 @@
             const printWindow = window.open(url, '_blank');
             
             if (printWindow) {
+                printWindow.opener = null;
                 printWindow.onload = function() {
                     // 等待MathJax加载和渲染完成
                     const waitForMathJax = () => {
@@ -840,6 +862,9 @@
         ocrCheckbox.onchange = () => {
             ocrEnabled = ocrCheckbox.checked;
             GM_setValue(OCR_ENABLED_KEY, ocrEnabled);
+            GM_setValue(STORAGE_KEY, null);
+            extractedQuestions = [];
+            countInfo.textContent = 'OCR设置已变更，请重新提取';
             showMessage(ocrEnabled ? 'OCR已启用' : 'OCR已禁用', 'info');
         };
         panel.appendChild(ocrToggle);
@@ -925,101 +950,50 @@
         countInfo.textContent = '正在自动提取...';
         panel.appendChild(countInfo);
 
-        // 从缓存加载或提取题目
         let extractedQuestions = getStoredQuestions() || [];
-        
-        // 自动提取函数
-        async function autoExtract() {
+        let extracting = false;
+        countInfo.textContent = extractedQuestions.length
+            ? `当前页面缓存 ${extractedQuestions.length} 道题目` : '等待提取当前页面题目';
+
+        async function runExtraction(notify = false) {
+            if (extracting) return [];
+            extracting = true;
+            [extractBtn, wordBtn, pdfBtn, ocrCheckbox].forEach(button => { button.disabled = true; });
+            const source = cacheIdentity();
+            countInfo.textContent = '正在提取当前页面...';
             try {
-                extractedQuestions = await extractQuestions();
-                if (extractedQuestions.length > 0) {
-                    saveQuestions(extractedQuestions);
-                    countInfo.textContent = `已提取 ${extractedQuestions.length} 道题目 (已缓存)`;
-                    countInfo.style.background = '#e8f5e9';
-                } else {
-                    countInfo.textContent = '未找到题目，请点击"提取题目"重试';
-                    countInfo.style.background = '#ffebee';
+                const questions = await extractQuestions();
+                if (source !== cacheIdentity()) {
+                    extractedQuestions = [];
+                    countInfo.textContent = '页面已切换，请在当前页面重新提取';
+                    return [];
                 }
+                extractedQuestions = questions;
+                saveQuestions(questions, source);
+                countInfo.textContent = questions.length ? `已提取 ${questions.length} 道题目` : '未找到题目，请确认题目已加载';
+                if (notify) showMessage(countInfo.textContent, questions.length ? 'success' : 'error');
+                return questions;
             } catch (error) {
-                console.error('自动提取失败:', error);
+                extractedQuestions = [];
                 countInfo.textContent = '提取失败，请重试';
-                countInfo.style.background = '#ffebee';
+                showMessage('提取失败: ' + error.message, 'error');
+                return [];
+            } finally {
+                extracting = false;
+                [extractBtn, wordBtn, pdfBtn, ocrCheckbox].forEach(button => { button.disabled = false; });
             }
         }
 
-        // 页面加载后延迟自动提取
-        setTimeout(() => {
-            autoExtract();
-        }, 2000);
-
-        extractBtn.onclick = async () => {
-            extractBtn.disabled = true;
-            extractBtn.textContent = '⏳ 提取中...';
-            try {
-                extractedQuestions = await extractQuestions();
-                if (extractedQuestions.length > 0) {
-                    saveQuestions(extractedQuestions);
-                    countInfo.textContent = `已提取 ${extractedQuestions.length} 道题目 (已缓存)`;
-                    countInfo.style.background = '#e8f5e9';
-                    showMessage(`成功提取 ${extractedQuestions.length} 道题目`, 'success');
-                } else {
-                    countInfo.textContent = '未找到题目';
-                    countInfo.style.background = '#ffebee';
-                    showMessage('未找到题目，请确保在学习通题目页面', 'error');
-                }
-            } catch (error) {
-                console.error('提取失败:', error);
-                showMessage('提取失败: ' + error.message, 'error');
-            } finally {
-                extractBtn.disabled = false;
-                extractBtn.textContent = '📋 提取题目';
-            }
-        };
-
+        // 每次导出重新读取当前页面，避免 SPA 导航或题目更新后导出旧内容。
+        setTimeout(() => runExtraction(), 2000);
+        extractBtn.onclick = () => runExtraction(true);
         wordBtn.onclick = async () => {
-            if (extractedQuestions.length === 0) {
-                wordBtn.disabled = true;
-                wordBtn.textContent = '⏳ 提取中...';
-                try {
-                    extractedQuestions = await extractQuestions();
-                    if (extractedQuestions.length > 0) {
-                        saveQuestions(extractedQuestions);
-                    }
-                } catch (error) {
-                    console.error('提取失败:', error);
-                } finally {
-                    wordBtn.disabled = false;
-                    wordBtn.textContent = '📄 导出Word';
-                }
-            }
-            if (extractedQuestions.length > 0) {
-                exportToWord(extractedQuestions);
-            } else {
-                showMessage('请先提取题目', 'error');
-            }
+            const questions = await runExtraction(true);
+            if (questions.length) await exportToWord(questions);
         };
-
         pdfBtn.onclick = async () => {
-            if (extractedQuestions.length === 0) {
-                pdfBtn.disabled = true;
-                pdfBtn.textContent = '⏳ 提取中...';
-                try {
-                    extractedQuestions = await extractQuestions();
-                    if (extractedQuestions.length > 0) {
-                        saveQuestions(extractedQuestions);
-                    }
-                } catch (error) {
-                    console.error('提取失败:', error);
-                } finally {
-                    pdfBtn.disabled = false;
-                    pdfBtn.textContent = '📑 导出PDF';
-                }
-            }
-            if (extractedQuestions.length > 0) {
-                exportToPDF(extractedQuestions);
-            } else {
-                showMessage('请先提取题目', 'error');
-            }
+            const questions = await runExtraction(true);
+            if (questions.length) await exportToPDF(questions);
         };
 
         closeBtn.onclick = () => {
@@ -1028,6 +1002,14 @@
 
         document.body.appendChild(panel);
     }
+
+    // 在 Node 中暴露逻辑供虚构 DOM 回归测试，浏览器仍直接运行。
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = { cleanText, escapeHtml, cacheIdentity, getStoredQuestions,
+            saveQuestions, extractQuestions, extractQuestionData, isVisible };
+        return;
+    }
+    ocrEnabled = GM_getValue(OCR_ENABLED_KEY, false);
 
     // 添加样式动画
     const style = document.createElement('style');
@@ -1076,4 +1058,5 @@
     });
 
 })();
+
 
